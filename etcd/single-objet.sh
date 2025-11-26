@@ -1,0 +1,1 @@
+export ETCDCTL_API=3; total_bytes=0; for key in $(etcdctl get /registry/replicasets/ --prefix --keys-only); do size=$(etcdctl get "$key" --print-value-only | wc -c); total_bytes=$((total_bytes + size)); done; echo "Total ReplicaSet size: $total_bytes bytes, approx $((total_bytes / 1024)) KB"
