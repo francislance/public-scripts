@@ -3,7 +3,7 @@
 # Trim Helm history based on the SUMMARY output of check-helm.sh.
 #
 # Usage:
-#   ./trim-helm-history-from-report.sh [--file=FILE] [--confirm=yes|no] [--failed-only]
+#   ./trim-helm-releases.sh [--file=FILE] [--confirm=yes|no] [--failed-only]
 #
 # Defaults:
 #   FILE          = helm-releases-summary.txt
