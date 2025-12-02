@@ -3,7 +3,7 @@
 # Trim Helm history based on the SUMMARY output of check-helm.sh.
 #
 # Usage:
-#   ./trim-helm-releases.sh [--file=FILE] [--confirm=yes|no] [--failed-only]
+#   ./trim-helm-history-from-report.sh [--file=FILE] [--confirm=yes|no] [--failed-only]
 #
 # Defaults:
 #   FILE          = helm-releases-summary.txt
@@ -11,10 +11,11 @@
 #
 # Modes:
 #   - Default: Read "History limit: X" from the summary file header.
-#              For each release, keep the latest X revisions, delete older ones
-#              by deleting sh.helm.release.v1.<release>.v<revision> secrets.
-#   - --failed-only: Ignore history limit; for each release, find revisions with
-#                    status == "failed" and delete only those.
+#              For each release, attempt to keep the latest X revisions by
+#              deleting older ones, BUT:
+#                * never delete revisions whose status is "deployed".
+#   - --failed-only: Ignore history limit; for each release, find revisions
+#                    whose status is "failed" and delete only those.
 #
 # Requirements:
 #   - bash (3.x+)
@@ -26,7 +27,7 @@ set -u
 
 CONFIRM="yes"                            # default behavior
 SOURCE_FILE="helm-releases-summary.txt"  # default file
-FAILED_ONLY="no"                         # default: process all using history limit
+FAILED_ONLY="no"                         # default: history-limit mode
 
 # ---------- Parse arguments ----------
 for arg in "$@"; do
@@ -118,6 +119,7 @@ echo ">>> Using input file: ${SOURCE_FILE}"
 echo ">>> CONFIRM       = ${CONFIRM} (yes = ask per release, no = non-interactive)"
 echo ">>> HISTORY_LIMIT = ${HISTORY_LIMIT} (used only when --failed-only is not set)"
 echo ">>> FAILED_ONLY   = ${FAILED_ONLY} (yes = delete only failed revisions)"
+echo ">>> NOTE          = Revisions with status 'deployed' are NEVER deleted."
 echo
 
 FOUND_LINES=0
@@ -152,6 +154,16 @@ while IFS='|' read -r NAMESPACE RELEASE_NAME REV_COUNT_REPORTED; do
     echo
     continue
   fi
+
+    # Show actual current revision count
+    COUNT="$(echo "${HISTORY_JSON}" | jq 'length')"
+    echo "  Actual current revision count: ${COUNT}"
+
+    # Print the full revision/status list for transparency
+    echo "  All revisions (current) with status:"
+    echo "${HISTORY_JSON}" \
+      | jq -r 'sort_by(.revision)[] | "    rev \(.revision): \(.status // "")"'
+    echo
 
   # ---------- MODE 1: FAILED_ONLY = yes ----------
   if [[ "${FAILED_ONLY}" == "yes" ]]; then
@@ -241,10 +253,7 @@ while IFS='|' read -r NAMESPACE RELEASE_NAME REV_COUNT_REPORTED; do
     continue
   fi
 
-  # ---------- MODE 2: FAILED_ONLY = no (history limit trimming) ----------
-
-  COUNT="$(echo "${HISTORY_JSON}" | jq 'length')"
-  echo "  Actual current revision count: ${COUNT}"
+  # ---------- MODE 2: FAILED_ONLY = no (history limit trimming, never delete 'deployed') ----------
 
   if [[ "${COUNT}" -le "${HISTORY_LIMIT}" ]]; then
     echo "  Info: Only ${COUNT} revision(s) present (<= ${HISTORY_LIMIT}). Nothing to delete."
@@ -252,20 +261,38 @@ while IFS='|' read -r NAMESPACE RELEASE_NAME REV_COUNT_REPORTED; do
     continue
   fi
 
-  # Extract revision numbers and sort ascending
-  ALL_REVS="$(echo "${HISTORY_JSON}" | jq '.[].revision' | sort -n)"
-  NUM_TO_DELETE=$(( COUNT - HISTORY_LIMIT ))
+  # Compute revisions selected for deletion:
+  # - Oldest revisions beyond HISTORY_LIMIT
+  # - But EXCLUDE any revision whose status is 'deployed'
+  REVS_TO_DELETE_STR="$(echo "${HISTORY_JSON}" \
+    | jq -r --argjson limit "${HISTORY_LIMIT}" '
+        (sort_by(.revision) | .) as $all
+        | ($all | length) as $count
+        | if $count <= $limit then
+            empty
+          else
+            ($count - $limit) as $num_to_delete
+            # candidate deletions: oldest non-deployed revisions
+            | $all
+            | sort_by(.revision)
+            | map(select((.status // "" | ascii_downcase) != "deployed"))[0:$num_to_delete]
+            | .[].revision
+          end
+      ' \
+    | sort -n)"
 
-  REVS_TO_DELETE_STR="$(echo "${ALL_REVS}" | head -n "${NUM_TO_DELETE}")"
-  REVS_TO_KEEP_STR="$(echo "${ALL_REVS}" | tail -n "${HISTORY_LIMIT}")"
+  if [[ -z "${REVS_TO_DELETE_STR}" ]]; then
+    echo "  Info: No deletable revisions found (either everything is 'deployed' or within limit)."
+    echo "        No action taken for this release."
+    echo
+    continue
+  fi
 
-  echo "  Revisions to keep (latest ${HISTORY_LIMIT}):"
-  echo "    ${REVS_TO_KEEP_STR}"
-  echo "  Revisions to delete (oldest ${NUM_TO_DELETE}):"
+  echo "  Revisions selected for deletion (non-deployed, oldest first):"
   echo "    ${REVS_TO_DELETE_STR}"
   echo
 
-  # Build list of secrets to be deleted (oldest revisions)
+  # Build list of secrets to be deleted (selected revisions)
   SECRETS_LIST=""
   while read -r REV; do
     [[ -z "${REV}" ]] && continue
@@ -318,7 +345,7 @@ while IFS='|' read -r NAMESPACE RELEASE_NAME REV_COUNT_REPORTED; do
     continue
   fi
 
-  # Perform deletions (oldest revisions beyond history limit)
+  # Perform deletions (selected non-deployed revisions)
   while read -r REV; do
     [[ -z "${REV}" ]] && continue
     SECRET_NAME="sh.helm.release.v1.${RELEASE_NAME}.v${REV}"
