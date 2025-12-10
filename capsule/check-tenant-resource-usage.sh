@@ -54,10 +54,10 @@ parse_mem_bytes() {
   local factor
   case "$unit" in
     Ki) factor=1024 ;;
-    Mi) factor=1048576 ;;          # 1024^2
-    Gi) factor=1073741824 ;;       # 1024^3
-    Ti) factor=1099511627776 ;;    # 1024^4
-    Pi) factor=1125899906842624 ;; # 1024^5
+    Mi) factor=1048576 ;;             # 1024^2
+    Gi) factor=1073741824 ;;          # 1024^3
+    Ti) factor=1099511627776 ;;       # 1024^4
+    Pi) factor=1125899906842624 ;;    # 1024^5
     Ei) factor=1152921504606846976 ;; # 1024^6
     K)  factor=1000 ;;
     M)  factor=1000000 ;;
@@ -129,14 +129,21 @@ if [[ -z "$namespaces" ]]; then
 fi
 
 # --- Totals ------------------------------------------------------------------
+# Pod sums
 total_limits_cpu_m=0
 total_limits_mem_b=0
+total_requests_cpu_m=0
+total_requests_mem_b=0
+
+# ResourceQuota sums
 quota_limits_cpu_m=0
 quota_limits_mem_b=0
+quota_requests_cpu_m=0
+quota_requests_mem_b=0
 
 # --- Main loop over namespaces ----------------------------------------------
 for ns in $namespaces; do
-  # Sum pod limits (containers + initContainers + ephemeralContainers)
+  # Sum pod LIMITS (containers + initContainers + ephemeralContainers)
   while read -r cpu; do
     [[ -z "$cpu" ]] && continue
     mc=$(parse_cpu_millicores "$cpu")
@@ -159,7 +166,30 @@ for ns in $namespaces; do
       | .resources.limits.memory? // empty'
   )
 
-  # Sum ResourceQuota limits.* (per namespace)
+  # Sum pod REQUESTS
+  while read -r cpu; do
+    [[ -z "$cpu" ]] && continue
+    mc=$(parse_cpu_millicores "$cpu")
+    total_requests_cpu_m=$(( total_requests_cpu_m + mc ))
+  done < <(
+    kubectl get pods -n "$ns" -o json \
+    | jq -r '.items[]
+      | (.spec.containers[]?, .spec.initContainers[]?, .spec.ephemeralContainers[]?)
+      | .resources.requests.cpu? // empty'
+  )
+
+  while read -r mem; do
+    [[ -z "$mem" ]] && continue
+    bytes=$(parse_mem_bytes "$mem")
+    total_requests_mem_b=$(( total_requests_mem_b + bytes ))
+  done < <(
+    kubectl get pods -n "$ns" -o json \
+    | jq -r '.items[]
+      | (.spec.containers[]?, .spec.initContainers[]?, .spec.ephemeralContainers[]?)
+      | .resources.requests.memory? // empty'
+  )
+
+  # Sum ResourceQuota limits.* and requests.* (per namespace)
   rq_json=$(kubectl get resourcequota -n "$ns" -o json)
 
   # limits.cpu
@@ -175,6 +205,20 @@ for ns in $namespaces; do
     bytes_q=$(parse_mem_bytes "$mem_q")
     quota_limits_mem_b=$(( quota_limits_mem_b + bytes_q ))
   done < <(echo "$rq_json" | jq -r '.items[].spec.hard["limits.memory"] // empty')
+
+  # requests.cpu
+  while read -r cpu_q; do
+    [[ -z "$cpu_q" ]] && continue
+    mc_q=$(parse_cpu_millicores "$cpu_q")
+    quota_requests_cpu_m=$(( quota_requests_cpu_m + mc_q ))
+  done < <(echo "$rq_json" | jq -r '.items[].spec.hard["requests.cpu"] // empty')
+
+  # requests.memory
+  while read -r mem_q; do
+    [[ -z "$mem_q" ]] && continue
+    bytes_q=$(parse_mem_bytes "$mem_q")
+    quota_requests_mem_b=$(( quota_requests_mem_b + bytes_q ))
+  done < <(echo "$rq_json" | jq -r '.items[].spec.hard["requests.memory"] // empty')
 done
 
 # --- Output ------------------------------------------------------------------
@@ -182,16 +226,31 @@ echo "Capsule Tenant : $TENANT"
 echo "Namespaces     : $namespaces"
 echo
 
-echo "=== Pod resource limits (sum across tenant namespaces) ==="
-echo "CPU limits     : $(format_cpu_cores "$total_limits_cpu_m")"
-echo "Memory limits  : $(format_bytes "$total_limits_mem_b")"
+echo "=== Pod resource REQUESTS (sum across tenant namespaces) ==="
+echo "CPU requests    : $(format_cpu_cores "$total_requests_cpu_m")"
+echo "Memory requests : $(format_bytes "$total_requests_mem_b")"
 echo
 
-echo "=== ResourceQuota hard limits (sum across tenant namespaces) ==="
-echo "limits.cpu     : $(format_cpu_cores "$quota_limits_cpu_m")"
-echo "limits.memory  : $(format_bytes "$quota_limits_mem_b")"
+echo "=== Pod resource LIMITS (sum across tenant namespaces) ==="
+echo "CPU limits      : $(format_cpu_cores "$total_limits_cpu_m")"
+echo "Memory limits   : $(format_bytes "$total_limits_mem_b")"
 echo
 
-echo "=== Usage vs Quota (based on pod limits) ==="
-echo "CPU   : $(format_cpu_cores "$total_limits_cpu_m") / $(format_cpu_cores "$quota_limits_cpu_m")  ($(percent "$total_limits_cpu_m" "$quota_limits_cpu_m"))"
-echo "Memory: $(format_bytes "$total_limits_mem_b") / $(format_bytes "$quota_limits_mem_b")  ($(percent "$total_limits_mem_b" "$quota_limits_mem_b"))"
+echo "=== ResourceQuota hard REQUESTS (sum across tenant namespaces) ==="
+echo "requests.cpu    : $(format_cpu_cores "$quota_requests_cpu_m")"
+echo "requests.memory : $(format_bytes "$quota_requests_mem_b")"
+echo
+
+echo "=== ResourceQuota hard LIMITS (sum across tenant namespaces) ==="
+echo "limits.cpu      : $(format_cpu_cores "$quota_limits_cpu_m")"
+echo "limits.memory   : $(format_bytes "$quota_limits_mem_b")"
+echo
+
+echo "=== Usage vs Quota based on REQUESTS ==="
+echo "CPU    : $(format_cpu_cores "$total_requests_cpu_m") / $(format_cpu_cores "$quota_requests_cpu_m")  ($(percent "$total_requests_cpu_m" "$quota_requests_cpu_m"))"
+echo "Memory : $(format_bytes "$total_requests_mem_b") / $(format_bytes "$quota_requests_mem_b")  ($(percent "$total_requests_mem_b" "$quota_requests_mem_b"))"
+echo
+
+echo "=== Usage vs Quota based on LIMITS ==="
+echo "CPU    : $(format_cpu_cores "$total_limits_cpu_m") / $(format_cpu_cores "$quota_limits_cpu_m")  ($(percent "$total_limits_cpu_m" "$quota_limits_cpu_m"))"
+echo "Memory : $(format_bytes "$total_limits_mem_b") / $(format_bytes "$quota_limits_mem_b")  ($(percent "$total_limits_mem_b" "$quota_limits_mem_b"))"
