@@ -10,13 +10,14 @@ PASS_B64_FILE="${KCL_HOME}/password.b64"
 PATTERN_FILE="${KCL_HOME}/login.pattern"
 # =========================
 
+# Default: 90 seconds. Override: KCL_TIMEOUT=30 kcl dev
+KCL_TIMEOUT="${KCL_TIMEOUT:-90}"
+
 CLUSTER="${1:-}"
+KCL_DEBUG="${KCL_DEBUG:-0}"
 
 trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
-
-need() {
-  command -v "$1" >/dev/null 2>&1 || exit 127
-}
+need() { command -v "$1" >/dev/null 2>&1 || exit 127; }
 
 get_row_for_cluster() {
   awk -F',' -v c="$1" '
@@ -29,7 +30,6 @@ get_row_for_cluster() {
 decode_password() {
   local b64
   b64="$(head -n 1 "$PASS_B64_FILE" | tr -d '\r\n' | trim)"
-
   if base64 --help 2>/dev/null | grep -q -- '-d'; then
     printf '%s' "$b64" | base64 -d | tr -d '\r\n'
   else
@@ -54,38 +54,34 @@ apply_pattern() {
 }
 
 spinner_start() {
-  # prints: Logging in. .. ... (updates every second)
   (
     local dots=1
     while true; do
-      printf '\rLogging in%*s' "$dots" ''
+      printf '\rLogging in%.*s   ' "$dots" "..."
       dots=$((dots + 1))
-      if [[ $dots -gt 3 ]]; then dots=1; fi
+      [[ $dots -gt 3 ]] && dots=1
       sleep 1
     done
   ) &
   echo $!
 }
 
-spinner_stop() {
+spinner_stop_with_message() {
   local pid="$1"
+  local msg="$2"
   kill "$pid" >/dev/null 2>&1 || true
   wait "$pid" >/dev/null 2>&1 || true
-  # clear line
-  printf '\r%*s\r' 40 ''
+  printf '\r%s\n' "$msg"
 }
 
 main() {
-  # Hard requirements
   need expect
   need awk
   need base64
 
-  # No chatter; just fail quietly with a minimal message
+  # Basic files must exist
   [[ -n "$CLUSTER" ]] || { echo "Login failed."; exit 1; }
-  [[ -f "$CSV_FILE" ]] || { echo "Login failed."; exit 1; }
-  [[ -f "$PASS_B64_FILE" ]] || { echo "Login failed."; exit 1; }
-  [[ -f "$PATTERN_FILE" ]] || { echo "Login failed."; exit 1; }
+  [[ -f "$CSV_FILE" && -f "$PASS_B64_FILE" && -f "$PATTERN_FILE" ]] || { echo "Login failed."; exit 1; }
 
   local row
   if ! row="$(get_row_for_cluster "$CLUSTER" 2>/dev/null)"; then
@@ -95,36 +91,53 @@ main() {
 
   local clustername k8s_url username auth_url
   IFS=',' read -r clustername k8s_url username auth_url <<<"$row"
-
   clustername="$(printf '%s' "$clustername" | trim)"
   k8s_url="$(printf '%s' "$k8s_url" | trim)"
   username="$(printf '%s' "$username" | trim)"
   auth_url="$(printf '%s' "$auth_url" | trim)"
 
-  [[ -n "$k8s_url" && -n "$username" && -n "$auth_url" ]] || { echo "Login failed."; exit 1; }
-
   local password pattern cmd
   password="$(decode_password 2>/dev/null || true)"
-  [[ -n "$password" ]] || { echo "Login failed."; exit 1; }
-
   pattern="$(load_pattern 2>/dev/null || true)"
-  [[ -n "$pattern" ]] || { echo "Login failed."; exit 1; }
+  [[ -n "$password" && -n "$pattern" && -n "$k8s_url" && -n "$username" && -n "$auth_url" ]] || { echo "Login failed."; exit 1; }
 
   cmd="$(apply_pattern "$pattern" "$clustername" "$k8s_url" "$username" "$auth_url")"
 
   export KCL_CMD="$cmd"
   export KCL_PASSWORD="$password"
+  export KCL_TIMEOUT="$KCL_TIMEOUT"
+  export KCL_DEBUG="$KCL_DEBUG"
 
-  # Start minimal animation
-  local spid
-  spid="$(spinner_start)"
+  local spid=""
+  if [[ "$KCL_DEBUG" != "1" ]]; then
+    spid="$(spinner_start)"
+  else
+    # Debug mode: show what skectl/expect sees
+    echo "DEBUG: running: $cmd"
+  fi
 
-  # Run expect silently (no stdout from skectl)
+  # Run expect in a way that:
+  # - injects password when prompted
+  # - has a GLOBAL timeout so it can't hang forever
   set +e
-  expect >/dev/null 2>&1 <<'EOF'
+  expect <<'EOF'
 set timeout -1
-log_user 0
+
+set t $env(KCL_TIMEOUT)
+set debug $env(KCL_DEBUG)
+
+if {$debug == "1"} {
+  exp_internal 0
+  log_user 1
+} else {
+  log_user 0
+}
+
+# Global watchdog: after KCL_TIMEOUT seconds, exit with code 124
+after [expr {$t * 1000}] { exit 124 }
+
 spawn sh -lc $env(KCL_CMD)
+
 set sent 0
 expect {
   -re {(?i)(password|passcode|pin)[^\r\n]*[:? ]*$} {
@@ -141,8 +154,11 @@ expect {
     }
     exp_continue
   }
+  # If skectl asks for something else (MFA/OTP/etc), we won't auto-respond.
+  # In debug mode, you'll see it.
   eof
 }
+
 catch wait result
 set exit_status [lindex $result 3]
 exit $exit_status
@@ -150,15 +166,30 @@ EOF
   rc=$?
   set -e
 
-  spinner_stop "$spid"
-
-  if [[ $rc -eq 0 ]]; then
-    # show nothing else; keep it clean
-    exit 0
+  if [[ "$KCL_DEBUG" != "1" ]]; then
+    if [[ $rc -eq 0 ]]; then
+      spinner_stop_with_message "$spid" "Logged in."
+      exit 0
+    elif [[ $rc -eq 124 ]]; then
+      spinner_stop_with_message "$spid" "Login timed out."
+      exit 124
+    else
+      spinner_stop_with_message "$spid" "Login failed."
+      exit 1
+    fi
+  else
+    # Debug mode prints output already
+    if [[ $rc -eq 0 ]]; then
+      echo "Logged in."
+      exit 0
+    elif [[ $rc -eq 124 ]]; then
+      echo "Login timed out."
+      exit 124
+    else
+      echo "Login failed."
+      exit 1
+    fi
   fi
-
-  echo "Login failed."
-  exit 1
 }
 
 main "$@"
