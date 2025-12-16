@@ -12,25 +12,13 @@ PATTERN_FILE="${KCL_HOME}/login.pattern"
 
 CLUSTER="${1:-}"
 
-usage() {
-  echo "Usage: kcl <clustername>"
-  echo "Debug: KCL_DEBUG=1 kcl <clustername>"
-  echo
-  echo "Files:"
-  echo "  $CSV_FILE"
-  echo "  $PASS_B64_FILE"
-  echo "  $PATTERN_FILE"
-}
-
-need() {
-  command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing command: $1" >&2; exit 1; }
-}
-
 trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
 
-get_row_for_cluster() {
-  [[ -f "$CSV_FILE" ]] || { echo "ERROR: CSV not found: $CSV_FILE" >&2; exit 1; }
+need() {
+  command -v "$1" >/dev/null 2>&1 || exit 127
+}
 
+get_row_for_cluster() {
   awk -F',' -v c="$1" '
     NR==1 { next }
     $1==c { print; found=1; exit }
@@ -39,13 +27,9 @@ get_row_for_cluster() {
 }
 
 decode_password() {
-  [[ -f "$PASS_B64_FILE" ]] || { echo "ERROR: password file not found: $PASS_B64_FILE" >&2; exit 1; }
-
   local b64
   b64="$(head -n 1 "$PASS_B64_FILE" | tr -d '\r\n' | trim)"
-  [[ -n "$b64" ]] || { echo "ERROR: password file is empty: $PASS_B64_FILE" >&2; exit 1; }
 
-  # Decode base64 + strip any trailing newline characters
   if base64 --help 2>/dev/null | grep -q -- '-d'; then
     printf '%s' "$b64" | base64 -d | tr -d '\r\n'
   else
@@ -54,14 +38,10 @@ decode_password() {
 }
 
 load_pattern() {
-  [[ -f "$PATTERN_FILE" ]] || { echo "ERROR: pattern file not found: $PATTERN_FILE" >&2; exit 1; }
-
-  local pat
-  pat="$(grep -v '^[[:space:]]*$' "$PATTERN_FILE" | grep -v '^[[:space:]]*#' | head -n 1 || true)"
-  pat="$(printf '%s' "$pat" | trim)"
-  [[ -n "$pat" ]] || { echo "ERROR: pattern file has no usable line: $PATTERN_FILE" >&2; exit 1; }
-
-  printf '%s' "$pat"
+  grep -v '^[[:space:]]*$' "$PATTERN_FILE" \
+    | grep -v '^[[:space:]]*#' \
+    | head -n 1 \
+    | trim
 }
 
 apply_pattern() {
@@ -73,21 +53,43 @@ apply_pattern() {
   printf '%s' "$pat"
 }
 
-main() {
-  [[ -n "$CLUSTER" ]] || { usage; exit 1; }
+spinner_start() {
+  # prints: Logging in. .. ... (updates every second)
+  (
+    local dots=1
+    while true; do
+      printf '\rLogging in%*s' "$dots" ''
+      dots=$((dots + 1))
+      if [[ $dots -gt 3 ]]; then dots=1; fi
+      sleep 1
+    done
+  ) &
+  echo $!
+}
 
+spinner_stop() {
+  local pid="$1"
+  kill "$pid" >/dev/null 2>&1 || true
+  wait "$pid" >/dev/null 2>&1 || true
+  # clear line
+  printf '\r%*s\r' 40 ''
+}
+
+main() {
+  # Hard requirements
   need expect
   need awk
   need base64
 
+  # No chatter; just fail quietly with a minimal message
+  [[ -n "$CLUSTER" ]] || { echo "Login failed."; exit 1; }
+  [[ -f "$CSV_FILE" ]] || { echo "Login failed."; exit 1; }
+  [[ -f "$PASS_B64_FILE" ]] || { echo "Login failed."; exit 1; }
+  [[ -f "$PATTERN_FILE" ]] || { echo "Login failed."; exit 1; }
+
   local row
-  if ! row="$(get_row_for_cluster "$CLUSTER")"; then
-    rc=$?
-    if [[ $rc -eq 2 ]]; then
-      echo "ERROR: clustername not found in CSV: $CLUSTER" >&2
-    else
-      echo "ERROR: failed reading CSV." >&2
-    fi
+  if ! row="$(get_row_for_cluster "$CLUSTER" 2>/dev/null)"; then
+    echo "Login failed."
     exit 1
   fi
 
@@ -99,33 +101,31 @@ main() {
   username="$(printf '%s' "$username" | trim)"
   auth_url="$(printf '%s' "$auth_url" | trim)"
 
-  [[ -n "$k8s_url" && -n "$username" && -n "$auth_url" ]] || {
-    echo "ERROR: CSV row missing fields for '$CLUSTER': $row" >&2
-    exit 1
-  }
+  [[ -n "$k8s_url" && -n "$username" && -n "$auth_url" ]] || { echo "Login failed."; exit 1; }
 
   local password pattern cmd
-  password="$(decode_password)"
-  pattern="$(load_pattern)"
+  password="$(decode_password 2>/dev/null || true)"
+  [[ -n "$password" ]] || { echo "Login failed."; exit 1; }
+
+  pattern="$(load_pattern 2>/dev/null || true)"
+  [[ -n "$pattern" ]] || { echo "Login failed."; exit 1; }
+
   cmd="$(apply_pattern "$pattern" "$clustername" "$k8s_url" "$username" "$auth_url")"
 
   export KCL_CMD="$cmd"
   export KCL_PASSWORD="$password"
-  export KCL_DEBUG="${KCL_DEBUG:-0}"
 
-  expect <<'EOF'
+  # Start minimal animation
+  local spid
+  spid="$(spinner_start)"
+
+  # Run expect silently (no stdout from skectl)
+  set +e
+  expect >/dev/null 2>&1 <<'EOF'
 set timeout -1
-
-if {[info exists env(KCL_DEBUG)] && $env(KCL_DEBUG) == "1"} {
-  exp_internal 1
-}
-
-log_user 1
+log_user 0
 spawn sh -lc $env(KCL_CMD)
-
 set sent 0
-
-# IMPORTANT: regex is inside { } so Tcl will NOT interpret backslashes.
 expect {
   -re {(?i)(password|passcode|pin)[^\r\n]*[:? ]*$} {
     if {$sent == 0} {
@@ -143,7 +143,22 @@ expect {
   }
   eof
 }
+catch wait result
+set exit_status [lindex $result 3]
+exit $exit_status
 EOF
+  rc=$?
+  set -e
+
+  spinner_stop "$spid"
+
+  if [[ $rc -eq 0 ]]; then
+    # show nothing else; keep it clean
+    exit 0
+  fi
+
+  echo "Login failed."
+  exit 1
 }
 
 main "$@"
