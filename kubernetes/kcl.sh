@@ -15,18 +15,22 @@ CLUSTER="${1:-}"
 usage() {
   echo "Usage: kcl <clustername>"
   echo "Debug: KCL_DEBUG=1 kcl <clustername>"
+  echo
+  echo "Files:"
+  echo "  $CSV_FILE"
+  echo "  $PASS_B64_FILE"
+  echo "  $PATTERN_FILE"
 }
 
 need() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "ERROR: missing command: $1" >&2
-    exit 1
-  }
+  command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing command: $1" >&2; exit 1; }
 }
 
 trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
 
 get_row_for_cluster() {
+  [[ -f "$CSV_FILE" ]] || { echo "ERROR: CSV not found: $CSV_FILE" >&2; exit 1; }
+
   awk -F',' -v c="$1" '
     NR==1 { next }
     $1==c { print; found=1; exit }
@@ -35,9 +39,13 @@ get_row_for_cluster() {
 }
 
 decode_password() {
+  [[ -f "$PASS_B64_FILE" ]] || { echo "ERROR: password file not found: $PASS_B64_FILE" >&2; exit 1; }
+
   local b64
   b64="$(head -n 1 "$PASS_B64_FILE" | tr -d '\r\n' | trim)"
+  [[ -n "$b64" ]] || { echo "ERROR: password file is empty: $PASS_B64_FILE" >&2; exit 1; }
 
+  # Decode base64 + strip any trailing newline characters
   if base64 --help 2>/dev/null | grep -q -- '-d'; then
     printf '%s' "$b64" | base64 -d | tr -d '\r\n'
   else
@@ -46,9 +54,14 @@ decode_password() {
 }
 
 load_pattern() {
-  grep -v '^[[:space:]]*$' "$PATTERN_FILE" \
-    | grep -v '^[[:space:]]*#' \
-    | head -n 1
+  [[ -f "$PATTERN_FILE" ]] || { echo "ERROR: pattern file not found: $PATTERN_FILE" >&2; exit 1; }
+
+  local pat
+  pat="$(grep -v '^[[:space:]]*$' "$PATTERN_FILE" | grep -v '^[[:space:]]*#' | head -n 1 || true)"
+  pat="$(printf '%s' "$pat" | trim)"
+  [[ -n "$pat" ]] || { echo "ERROR: pattern file has no usable line: $PATTERN_FILE" >&2; exit 1; }
+
+  printf '%s' "$pat"
 }
 
 apply_pattern() {
@@ -57,23 +70,41 @@ apply_pattern() {
   pat="${pat//\{kubernetes-api-url\}/$3}"
   pat="${pat//\{username\}/$4}"
   pat="${pat//\{auth-api-url\}/$5}"
-  echo "$pat"
+  printf '%s' "$pat"
 }
 
 main() {
   [[ -n "$CLUSTER" ]] || { usage; exit 1; }
 
   need expect
-  need base64
   need awk
+  need base64
 
-  row="$(get_row_for_cluster "$CLUSTER")" || {
-    echo "ERROR: cluster not found: $CLUSTER" >&2
+  local row
+  if ! row="$(get_row_for_cluster "$CLUSTER")"; then
+    rc=$?
+    if [[ $rc -eq 2 ]]; then
+      echo "ERROR: clustername not found in CSV: $CLUSTER" >&2
+    else
+      echo "ERROR: failed reading CSV." >&2
+    fi
+    exit 1
+  fi
+
+  local clustername k8s_url username auth_url
+  IFS=',' read -r clustername k8s_url username auth_url <<<"$row"
+
+  clustername="$(printf '%s' "$clustername" | trim)"
+  k8s_url="$(printf '%s' "$k8s_url" | trim)"
+  username="$(printf '%s' "$username" | trim)"
+  auth_url="$(printf '%s' "$auth_url" | trim)"
+
+  [[ -n "$k8s_url" && -n "$username" && -n "$auth_url" ]] || {
+    echo "ERROR: CSV row missing fields for '$CLUSTER': $row" >&2
     exit 1
   }
 
-  IFS=',' read -r clustername k8s_url username auth_url <<<"$row"
-
+  local password pattern cmd
   password="$(decode_password)"
   pattern="$(load_pattern)"
   cmd="$(apply_pattern "$pattern" "$clustername" "$k8s_url" "$username" "$auth_url")"
@@ -85,7 +116,7 @@ main() {
   expect <<'EOF'
 set timeout -1
 
-if {$env(KCL_DEBUG) == "1"} {
+if {[info exists env(KCL_DEBUG)] && $env(KCL_DEBUG) == "1"} {
   exp_internal 1
 }
 
@@ -93,15 +124,17 @@ log_user 1
 spawn sh -lc $env(KCL_CMD)
 
 set sent 0
+
+# IMPORTANT: regex is inside { } so Tcl will NOT interpret backslashes.
 expect {
-  -re "(?i)(password|passcode|pin)[^\r\n]*[:? ]*$" {
+  -re {(?i)(password|passcode|pin)[^\r\n]*[:? ]*$} {
     if {$sent == 0} {
       send -- "$env(KCL_PASSWORD)\r"
       set sent 1
     }
     exp_continue
   }
-  -re "(?i)(enter|type)[^\r\n]*(password|passcode|pin)[^\r\n]*$" {
+  -re {(?i)(enter|type)[^\r\n]*(password|passcode|pin)[^\r\n]*$} {
     if {$sent == 0} {
       send -- "$env(KCL_PASSWORD)\r"
       set sent 1
