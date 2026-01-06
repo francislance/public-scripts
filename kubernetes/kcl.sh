@@ -89,19 +89,31 @@ main() {
     exit 1
   fi
 
+  # Allow rows with either:
+  #   clustername,kubernetes-api-url,username
+  # or
+  #   clustername,kubernetes-api-url,username,auth-api-url
   local clustername k8s_url username auth_url
   IFS=',' read -r clustername k8s_url username auth_url <<<"$row"
   clustername="$(printf '%s' "$clustername" | trim)"
   k8s_url="$(printf '%s' "$k8s_url" | trim)"
   username="$(printf '%s' "$username" | trim)"
-  auth_url="$(printf '%s' "$auth_url" | trim)"
+  auth_url="$(printf '%s' "${auth_url:-}" | trim)"   # may be empty
 
   local password pattern cmd
   password="$(decode_password 2>/dev/null || true)"
   pattern="$(load_pattern 2>/dev/null || true)"
-  [[ -n "$password" && -n "$pattern" && -n "$k8s_url" && -n "$username" && -n "$auth_url" ]] || { echo "Login failed."; exit 1; }
+
+  # Require only: password, pattern, k8s_url, username. auth_url is optional.
+  [[ -n "$password" && -n "$pattern" && -n "$k8s_url" && -n "$username" ]] || { echo "Login failed."; exit 1; }
 
   cmd="$(apply_pattern "$pattern" "$clustername" "$k8s_url" "$username" "$auth_url")"
+
+  # If auth_url is empty, remove the "-s <value>" part from the command (and clean extra spaces)
+  if [[ -z "$auth_url" ]]; then
+    # Remove: -s {auth-api-url}
+    cmd="$(printf '%s' "$cmd" | sed -E 's/[[:space:]]+-s[[:space:]]+[^[:space:]]+//g' | tr -s ' ' | trim)"
+  fi
 
   export KCL_CMD="$cmd"
   export KCL_PASSWORD="$password"
@@ -112,13 +124,9 @@ main() {
   if [[ "$KCL_DEBUG" != "1" ]]; then
     spid="$(spinner_start)"
   else
-    # Debug mode: show what skectl/expect sees
     echo "DEBUG: running: $cmd"
   fi
 
-  # Run expect in a way that:
-  # - injects password when prompted
-  # - has a GLOBAL timeout so it can't hang forever
   set +e
   expect <<'EOF'
 set timeout -1
@@ -154,8 +162,6 @@ expect {
     }
     exp_continue
   }
-  # If skectl asks for something else (MFA/OTP/etc), we won't auto-respond.
-  # In debug mode, you'll see it.
   eof
 }
 
@@ -178,7 +184,6 @@ EOF
       exit 1
     fi
   else
-    # Debug mode prints output already
     if [[ $rc -eq 0 ]]; then
       echo "Logged in."
       exit 0
