@@ -44,34 +44,30 @@ load_pattern() {
     | trim
 }
 
+# Pattern supports:
+#  - {kubernetes-api-url}
+#  - {username}
+#  - {auth-flag}   -> becomes "-s <auth-url>" or "" if missing
+#  - {clustername} -> optional
 apply_pattern() {
   local pat="$1"
-  pat="${pat//\{clustername\}/$2}"
-  pat="${pat//\{kubernetes-api-url\}/$3}"
-  pat="${pat//\{username\}/$4}"
-  pat="${pat//\{auth-api-url\}/$5}"
-  printf '%s' "$pat"
-}
+  local clustername="$2"
+  local k8s_url="$3"
+  local username="$4"
+  local auth_url="${5:-}"
 
-# Build final command safely for rows that may not have auth_url.
-# If auth_url is empty:
-#   - remove the placeholder output (will be empty already)
-#   - remove the "-s" token (ONLY the token), without eating the next arg like "-i"
-#   - normalize whitespace
-finalize_cmd_for_optional_auth() {
-  local cmd="$1"
-  local auth_url="$2"
-
-  if [[ -z "$auth_url" ]]; then
-    # Remove " -s " (as a standalone option) but keep the next token intact (like -i).
-    # This avoids the bug where "-s  -i" makes "-i" become the argument of -s.
-    cmd="$(printf '%s' "$cmd" \
-      | sed -E 's/(^|[[:space:]])-s([[:space:]]|$)/ /g' \
-      | tr -s ' ' \
-      | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  local auth_flag=""
+  if [[ -n "$auth_url" ]]; then
+    auth_flag="-s $auth_url"
   fi
 
-  printf '%s' "$cmd"
+  pat="${pat//\{clustername\}/$clustername}"
+  pat="${pat//\{kubernetes-api-url\}/$k8s_url}"
+  pat="${pat//\{username\}/$username}"
+  pat="${pat//\{auth-flag\}/$auth_flag}"
+
+  # normalize spaces (important when auth_flag becomes empty)
+  printf '%s' "$pat" | tr -s ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
 spinner_start() {
@@ -110,25 +106,24 @@ main() {
     exit 1
   fi
 
-  # Allow mixed rows:
-  # - 3 cols: clustername,kubernetes-api-url,username
-  # - 4 cols: clustername,kubernetes-api-url,username,auth-api-url
+  # Mixed CSV rows allowed:
+  # - 3 columns: clustername,kubernetes-api-url,username
+  # - 4 columns: clustername,kubernetes-api-url,username,auth-api-url
   local clustername k8s_url username auth_url
   IFS=',' read -r clustername k8s_url username auth_url <<<"$row"
   clustername="$(printf '%s' "$clustername" | trim)"
   k8s_url="$(printf '%s' "$k8s_url" | trim)"
   username="$(printf '%s' "$username" | trim)"
-  auth_url="$(printf '%s' "${auth_url:-}" | trim)"   # optional
+  auth_url="$(printf '%s' "${auth_url:-}" | trim)"
 
   local password pattern cmd
   password="$(decode_password 2>/dev/null || true)"
   pattern="$(load_pattern 2>/dev/null || true)"
 
-  # Only require k8s_url + username + pattern + password
+  # Require only: password, pattern, k8s_url, username
   [[ -n "$password" && -n "$pattern" && -n "$k8s_url" && -n "$username" ]] || { echo "Login failed."; exit 1; }
 
   cmd="$(apply_pattern "$pattern" "$clustername" "$k8s_url" "$username" "$auth_url")"
-  cmd="$(finalize_cmd_for_optional_auth "$cmd" "$auth_url")"
 
   export KCL_CMD="$cmd"
   export KCL_PASSWORD="$password"
@@ -139,13 +134,12 @@ main() {
   if [[ "$KCL_DEBUG" != "1" ]]; then
     spid="$(spinner_start)"
   else
-    # Debug mode: show what skectl/expect sees
     echo "DEBUG: running: $cmd"
   fi
 
-  # Run expect in a way that:
-  # - injects password when prompted
-  # - has a GLOBAL timeout so it can't hang forever
+  # Run expect:
+  # - inject password when prompted
+  # - global timeout
   set +e
   expect <<'EOF'
 set timeout -1
@@ -203,7 +197,6 @@ EOF
       exit 1
     fi
   else
-    # Debug mode prints output already
     if [[ $rc -eq 0 ]]; then
       echo "Logged in."
       exit 0
