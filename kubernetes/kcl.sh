@@ -53,6 +53,27 @@ apply_pattern() {
   printf '%s' "$pat"
 }
 
+# Build final command safely for rows that may not have auth_url.
+# If auth_url is empty:
+#   - remove the placeholder output (will be empty already)
+#   - remove the "-s" token (ONLY the token), without eating the next arg like "-i"
+#   - normalize whitespace
+finalize_cmd_for_optional_auth() {
+  local cmd="$1"
+  local auth_url="$2"
+
+  if [[ -z "$auth_url" ]]; then
+    # Remove " -s " (as a standalone option) but keep the next token intact (like -i).
+    # This avoids the bug where "-s  -i" makes "-i" become the argument of -s.
+    cmd="$(printf '%s' "$cmd" \
+      | sed -E 's/(^|[[:space:]])-s([[:space:]]|$)/ /g' \
+      | tr -s ' ' \
+      | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  fi
+
+  printf '%s' "$cmd"
+}
+
 spinner_start() {
   (
     local dots=1
@@ -89,10 +110,9 @@ main() {
     exit 1
   fi
 
-  # Allow rows with either:
-  #   clustername,kubernetes-api-url,username
-  # or
-  #   clustername,kubernetes-api-url,username,auth-api-url
+  # Allow mixed rows:
+  # - 3 cols: clustername,kubernetes-api-url,username
+  # - 4 cols: clustername,kubernetes-api-url,username,auth-api-url
   local clustername k8s_url username auth_url
   IFS=',' read -r clustername k8s_url username auth_url <<<"$row"
   clustername="$(printf '%s' "$clustername" | trim)"
@@ -104,19 +124,11 @@ main() {
   password="$(decode_password 2>/dev/null || true)"
   pattern="$(load_pattern 2>/dev/null || true)"
 
-  # Require only: password, pattern, k8s_url, username. auth_url is optional.
+  # Only require k8s_url + username + pattern + password
   [[ -n "$password" && -n "$pattern" && -n "$k8s_url" && -n "$username" ]] || { echo "Login failed."; exit 1; }
 
   cmd="$(apply_pattern "$pattern" "$clustername" "$k8s_url" "$username" "$auth_url")"
-
-  # ✅ If auth_url is empty, remove "-s" whether it has a value or not.
-  # This fixes cases like: "-s  -i" (where -i gets consumed as the -s value)
-  if [[ -z "$auth_url" ]]; then
-    cmd="$(printf '%s' "$cmd" \
-      | sed -E 's/[[:space:]]+-s([[:space:]]+[^[:space:]]+)?//g' \
-      | tr -s ' ' \
-      | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-  fi
+  cmd="$(finalize_cmd_for_optional_auth "$cmd" "$auth_url")"
 
   export KCL_CMD="$cmd"
   export KCL_PASSWORD="$password"
