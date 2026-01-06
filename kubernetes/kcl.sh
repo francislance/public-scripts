@@ -39,42 +39,25 @@ decode_password() {
 
 load_pattern() {
   grep -v '^[[:space:]]*$' "$PATTERN_FILE" \
-    | grep -v '^[[:space:]]*#' \
-    | head -n 1 \
-    | trim
+  | grep -v '^[[:space:]]*#' \
+  | head -n 1 \
+  | trim
 }
 
-# Pattern supports:
-#  - {kubernetes-api-url}
-#  - {username}
-#  - {auth-flag}   -> becomes "-s <auth-url>" or "" if missing
-#  - {clustername} -> optional
 apply_pattern() {
   local pat="$1"
-  local clustername="$2"
-  local k8s_url="$3"
-  local username="$4"
-  local auth_url="${5:-}"
-
-  local auth_flag=""
-  if [[ -n "$auth_url" ]]; then
-    auth_flag="-s $auth_url"
-  fi
-
-  pat="${pat//\{clustername\}/$clustername}"
-  pat="${pat//\{kubernetes-api-url\}/$k8s_url}"
-  pat="${pat//\{username\}/$username}"
-  pat="${pat//\{auth-flag\}/$auth_flag}"
-
-  # normalize spaces (important when auth_flag becomes empty)
-  printf '%s' "$pat" | tr -s ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+  pat="${pat//\{clustername\}/$2}"
+  pat="${pat//\{kubernetes-api-url\}/$3}"
+  pat="${pat//\{username\}/$4}"
+  pat="${pat//\{auth-api-url\}/$5}"
+  printf '%s' "$pat"
 }
 
 spinner_start() {
   (
     local dots=1
     while true; do
-      printf '\rLogging in%.*s   ' "$dots" "..."
+      printf '\rLogging in%.*s ' "$dots" "..."
       dots=$((dots + 1))
       [[ $dots -gt 3 ]] && dots=1
       sleep 1
@@ -96,7 +79,6 @@ main() {
   need awk
   need base64
 
-  # Basic files must exist
   [[ -n "$CLUSTER" ]] || { echo "Login failed."; exit 1; }
   [[ -f "$CSV_FILE" && -f "$PASS_B64_FILE" && -f "$PATTERN_FILE" ]] || { echo "Login failed."; exit 1; }
 
@@ -106,22 +88,19 @@ main() {
     exit 1
   fi
 
-  # Mixed CSV rows allowed:
-  # - 3 columns: clustername,kubernetes-api-url,username
-  # - 4 columns: clustername,kubernetes-api-url,username,auth-api-url
   local clustername k8s_url username auth_url
   IFS=',' read -r clustername k8s_url username auth_url <<<"$row"
   clustername="$(printf '%s' "$clustername" | trim)"
   k8s_url="$(printf '%s' "$k8s_url" | trim)"
   username="$(printf '%s' "$username" | trim)"
-  auth_url="$(printf '%s' "${auth_url:-}" | trim)"
+  auth_url="$(printf '%s' "$auth_url" | trim)"
 
   local password pattern cmd
   password="$(decode_password 2>/dev/null || true)"
   pattern="$(load_pattern 2>/dev/null || true)"
 
-  # Require only: password, pattern, k8s_url, username
-  [[ -n "$password" && -n "$pattern" && -n "$k8s_url" && -n "$username" ]] || { echo "Login failed."; exit 1; }
+  [[ -n "$password" && -n "$pattern" && -n "$k8s_url" && -n "$username" && -n "$auth_url" ]] \
+    || { echo "Login failed."; exit 1; }
 
   cmd="$(apply_pattern "$pattern" "$clustername" "$k8s_url" "$username" "$auth_url")"
 
@@ -137,9 +116,6 @@ main() {
     echo "DEBUG: running: $cmd"
   fi
 
-  # Run expect:
-  # - inject password when prompted
-  # - global timeout
   set +e
   expect <<'EOF'
 set timeout -1
@@ -154,7 +130,6 @@ if {$debug == "1"} {
   log_user 0
 }
 
-# Global watchdog: after KCL_TIMEOUT seconds, exit with code 124
 after [expr {$t * 1000}] { exit 124 }
 
 spawn sh -lc $env(KCL_CMD)
