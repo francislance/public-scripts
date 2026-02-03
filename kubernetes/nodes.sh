@@ -8,3 +8,8 @@ kubectl get nodes \
   -o custom-columns='NAME:.metadata.name,CPU:.status.capacity.cpu,MEMORY:.status.capacity.memory,CPU-ALLOCATABLE:.status.allocatable.cpu,MEM-ALLOCATABLE:.status.allocatable.memory'
 
 
+  kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.capacity.cpu}{"\t"}{.status.capacity.memory}{"\n"}{end}' \
+  | awk 'BEGIN{OFS="\t"; print "NAME","CPU","MEM(Gi)"} NR>1{memKi=$3; gsub(/Ki/,"",memKi); printf "%s\t%s\t%.2f\n",$1,$2,memKi/1024/1024}'
+
+
+
