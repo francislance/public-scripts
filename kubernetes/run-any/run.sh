@@ -21,7 +21,7 @@ set -euo pipefail
 # Notes:
 #   - Pipes/grep/etc work because we execute via: bash -lc "<command>"
 #   - Captures stdout+stderr to results file.
-#   - Uses `ske <cluster>` to login per cluster (adjust if needed).
+#   - Uses `lancelogin <cluster>` to login per cluster (adjust if needed).
 # ------------------------------------------------------------
 
 usage() {
@@ -49,7 +49,7 @@ Output:
 
 Requires:
   - kubectl
-  - ske (per-cluster login)
+  - lancelogin (per-cluster login)
 EOF
 }
 
@@ -58,7 +58,7 @@ log() { echo "[$(ts)] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 command -v kubectl >/dev/null 2>&1 || die "kubectl not found in PATH"
-command -v ske     >/dev/null 2>&1 || die "ske not found in PATH (replace in script if needed)"
+command -v lancelogin     >/dev/null 2>&1 || die "lancelogin not found in PATH (replace in script if needed)"
 command -v bash    >/dev/null 2>&1 || die "bash not found (unexpected on macOS)"
 
 ENV_ARG="${1:-}"
@@ -137,11 +137,11 @@ while IFS= read -r raw || [[ -n "${raw}" ]]; do
   } >> "${RESULTS_FILE}"
 
   log "Cluster: ${cluster}"
-  log "  Step: ske login"
-  if ! ske "${cluster}" >/dev/null 2>&1; then
-    echo "[WARN] ske login failed for cluster: ${cluster}" >> "${RESULTS_FILE}"
+  log "  Step: lancelogin login"
+  if ! lancelogin "${cluster}" >/dev/null 2>&1; then
+    echo "[WARN] lancelogin login failed for cluster: ${cluster}" >> "${RESULTS_FILE}"
     echo "" >> "${RESULTS_FILE}"
-    log "  WARN: ske login failed (skipping)"
+    log "  WARN: lancelogin login failed (skipping)"
     continue
   fi
 
