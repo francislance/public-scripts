@@ -1,36 +1,65 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ------------------------------------------------------------
+# run.sh
+#
+# Runs a READ-ONLY kubectl command across all clusters listed in
+# <env>_clusters.txt and writes output to results-<timestamp>.txt
+# with per-cluster sections.
+#
+# CLI (exactly as you want):
+#   ./run.sh prod "kubectl get pods"
+#   ./run.sh stg  "kubectl describe pod mypod -n myns"
+#   ./run.sh stg  "kubectl get tnt | grep -i wrb"
+#
+# Enforced rule:
+#   - Command (after optional leading spaces) MUST start with:
+#       kubectl get ...
+#       kubectl describe ...
+#
+# Notes:
+#   - Pipes/grep/etc work because we execute via: bash -lc "<command>"
+#   - Captures stdout+stderr to results file.
+#   - Uses `lancelogin <cluster>` to login per cluster (adjust if needed).
+# ------------------------------------------------------------
+
 usage() {
   cat <<'EOF'
 Usage:
   ./run.sh <env> "<kubectl command>"
 
+Where:
+  <env> must be: prod | stg | dev
+  "<kubectl command>" must start with: kubectl get ...  OR  kubectl describe ...
+
 Examples:
   ./run.sh prod "kubectl get pods"
   ./run.sh prod "kubectl get pods -A -o wide"
   ./run.sh stg  "kubectl describe pod mypod -n myns"
-
-Rules:
-  - Command must start with: kubectl
-  - Only read-only kubectl verbs allowed: get | describe
-  - Output: results-<timestamp>.txt (in current dir)
+  ./run.sh stg  "kubectl get tnt | grep -i wrb"
+  ./run.sh dev  "kubectl get nodes | grep -i ready"
 
 Clusters file:
   ./prod_clusters.txt, ./stg_clusters.txt, ./dev_clusters.txt
+  (Supports blank lines and comments starting with '#')
+
+Output:
+  ./results-<timestamp>.txt
 
 Requires:
   - kubectl
-  - lancelogin (used to login to each cluster)
+  - lancelogin (per-cluster login)
 EOF
 }
 
-ts() { date +"%Y-%m-%d %H:%M:%S"; }
+ts()  { date +"%Y-%m-%d %H:%M:%S"; }
 log() { echo "[$(ts)] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 command -v kubectl >/dev/null 2>&1 || die "kubectl not found in PATH"
 command -v lancelogin     >/dev/null 2>&1 || die "lancelogin not found in PATH (replace in script if needed)"
+command -v bash    >/dev/null 2>&1 || die "bash not found (unexpected on macOS)"
 
 ENV_ARG="${1:-}"
 CMD_STR="${2:-}"
@@ -49,24 +78,35 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTERS_FILE="${SCRIPT_DIR}/${ENV_ARG}_clusters.txt"
 [[ -f "${CLUSTERS_FILE}" ]] || die "Clusters file not found: ${CLUSTERS_FILE}"
 
-# Split the quoted kubectl command safely into tokens (supports flags/args)
-# shellcheck disable=SC2206
-TOKENS=( ${CMD_STR} )
+# Avoid kubectl paging
+export KUBECTL_PAGER=cat
 
-[[ ${#TOKENS[@]} -ge 2 ]] || die "Command must be like: \"kubectl get ...\" or \"kubectl describe ...\""
+# -----------------------------
+# Validate command is read-only
+# -----------------------------
+# Trim leading spaces
+trimmed="${CMD_STR#"${CMD_STR%%[![:space:]]*}"}"
 
-[[ "${TOKENS[0]}" == "kubectl" ]] || die "Command must start with 'kubectl'"
-VERB="${TOKENS[1]}"
-[[ "${VERB}" == "get" || "${VERB}" == "describe" ]] || die "Only 'kubectl get' or 'kubectl describe' allowed (got '${VERB}')"
+# Must start with: kubectl get ... OR kubectl describe ...
+if [[ ! "${trimmed}" =~ ^kubectl[[:space:]]+(get|describe)([[:space:]]|$) ]]; then
+  die "Command must start with 'kubectl get' or 'kubectl describe'. Got: ${CMD_STR}"
+fi
 
-# Remove leading "kubectl" so we can run: kubectl "${ARGS[@]}"
-ARGS=( "${TOKENS[@]:1}" )
+# (Optional but recommended) block obvious shell-chaining / output redirection
+# so users can't do: "kubectl get pods; rm -rf /" or redirect secrets to files.
+# If you WANT to allow these, comment out this block.
+if echo "${CMD_STR}" | grep -Eq '[;&]|\|\||&&|`|\$\(|\)|(^|[[:space:]])>(>|&)?|(^|[[:space:]])<(<?)?'; then
+  die "Unsafe shell operators detected. Allowed: pipes '|' only (plus normal args)."
+fi
+
+# Also block dangerous kubectl verbs if someone tries to sneak them in.
+# (Even though we require the command starts with get/describe, keep this anyway.)
+if echo "${CMD_STR}" | grep -Eq '(^|[[:space:]])kubectl[[:space:]]+(apply|delete|edit|patch|replace|create|run|exec|cp|attach|scale|rollout|set|label|annotate|autoscale|drain|cordon|uncordon|taint)([[:space:]]|$)'; then
+  die "Blocked kubectl verb detected. Only 'get' or 'describe' allowed."
+fi
 
 RUN_TS="$(date +'%Y%m%d-%H%M%S')"
 RESULTS_FILE="${SCRIPT_DIR}/results-${RUN_TS}.txt"
-
-# Avoid kubectl paging
-export KUBECTL_PAGER=cat
 
 log "Starting run"
 log "Env          : ${ENV_ARG}"
@@ -111,12 +151,19 @@ while IFS= read -r raw || [[ -n "${raw}" ]]; do
   echo "Current context: ${ctx}" >> "${RESULTS_FILE}"
   echo "" >> "${RESULTS_FILE}"
 
-  log "  Step: run kubectl ${ARGS[*]}"
-  # Capture stdout+stderr so errors are recorded too
-  if ! kubectl "${ARGS[@]}" --request-timeout=30s >> "${RESULTS_FILE}" 2>&1; then
+  # Add request timeout unless user already provided one
+  CMD_TO_RUN="${CMD_STR}"
+  if [[ "${CMD_STR}" != *"--request-timeout"* ]]; then
+    CMD_TO_RUN="${CMD_STR} --request-timeout=30s"
+  fi
+
+  log "  Step: run ${CMD_TO_RUN}"
+
+  # Run via bash so pipes/grep work; capture stdout+stderr
+  if ! bash -lc "${CMD_TO_RUN}" >> "${RESULTS_FILE}" 2>&1; then
     echo "" >> "${RESULTS_FILE}"
-    echo "[WARN] kubectl command failed for cluster: ${cluster}" >> "${RESULTS_FILE}"
-    log "  WARN: kubectl failed (recorded)"
+    echo "[WARN] command failed for cluster: ${cluster}" >> "${RESULTS_FILE}"
+    log "  WARN: command failed (recorded)"
   fi
 
   echo "" >> "${RESULTS_FILE}"
