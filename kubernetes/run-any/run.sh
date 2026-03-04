@@ -8,7 +8,7 @@ set -euo pipefail
 # <env>_clusters.txt and writes output to results-<timestamp>.txt
 # with per-cluster sections.
 #
-# CLI (exactly as you want):
+# CLI (exactly as requested):
 #   ./run.sh prod "kubectl get pods"
 #   ./run.sh stg  "kubectl describe pod mypod -n myns"
 #   ./run.sh stg  "kubectl get tnt | grep -i wrb"
@@ -21,7 +21,7 @@ set -euo pipefail
 # Notes:
 #   - Pipes/grep/etc work because we execute via: bash -lc "<command>"
 #   - Captures stdout+stderr to results file.
-#   - Uses `lancelogin <cluster>` to login per cluster (adjust if needed).
+#   - Uses `ske <cluster>` to login per cluster (adjust if needed).
 # ------------------------------------------------------------
 
 usage() {
@@ -49,7 +49,7 @@ Output:
 
 Requires:
   - kubectl
-  - lancelogin (per-cluster login)
+  - ske (per-cluster login)
 EOF
 }
 
@@ -58,7 +58,7 @@ log() { echo "[$(ts)] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 command -v kubectl >/dev/null 2>&1 || die "kubectl not found in PATH"
-command -v lancelogin     >/dev/null 2>&1 || die "lancelogin not found in PATH (replace in script if needed)"
+command -v ske     >/dev/null 2>&1 || die "ske not found in PATH (replace in script if needed)"
 command -v bash    >/dev/null 2>&1 || die "bash not found (unexpected on macOS)"
 
 ENV_ARG="${1:-}"
@@ -93,14 +93,13 @@ if [[ ! "${trimmed}" =~ ^kubectl[[:space:]]+(get|describe)([[:space:]]|$) ]]; th
 fi
 
 # (Optional but recommended) block obvious shell-chaining / output redirection
-# so users can't do: "kubectl get pods; rm -rf /" or redirect secrets to files.
+# so users can't do: "kubectl get pods; rm -rf /" or redirect output to files.
 # If you WANT to allow these, comment out this block.
 if echo "${CMD_STR}" | grep -Eq '[;&]|\|\||&&|`|\$\(|\)|(^|[[:space:]])>(>|&)?|(^|[[:space:]])<(<?)?'; then
   die "Unsafe shell operators detected. Allowed: pipes '|' only (plus normal args)."
 fi
 
 # Also block dangerous kubectl verbs if someone tries to sneak them in.
-# (Even though we require the command starts with get/describe, keep this anyway.)
 if echo "${CMD_STR}" | grep -Eq '(^|[[:space:]])kubectl[[:space:]]+(apply|delete|edit|patch|replace|create|run|exec|cp|attach|scale|rollout|set|label|annotate|autoscale|drain|cordon|uncordon|taint)([[:space:]]|$)'; then
   die "Blocked kubectl verb detected. Only 'get' or 'describe' allowed."
 fi
@@ -138,11 +137,11 @@ while IFS= read -r raw || [[ -n "${raw}" ]]; do
   } >> "${RESULTS_FILE}"
 
   log "Cluster: ${cluster}"
-  log "  Step: lancelogin login"
-  if ! lancelogin "${cluster}" >/dev/null 2>&1; then
-    echo "[WARN] lancelogin login failed for cluster: ${cluster}" >> "${RESULTS_FILE}"
+  log "  Step: ske login"
+  if ! ske "${cluster}" >/dev/null 2>&1; then
+    echo "[WARN] ske login failed for cluster: ${cluster}" >> "${RESULTS_FILE}"
     echo "" >> "${RESULTS_FILE}"
-    log "  WARN: lancelogin login failed (skipping)"
+    log "  WARN: ske login failed (skipping)"
     continue
   fi
 
@@ -151,16 +150,10 @@ while IFS= read -r raw || [[ -n "${raw}" ]]; do
   echo "Current context: ${ctx}" >> "${RESULTS_FILE}"
   echo "" >> "${RESULTS_FILE}"
 
-  # Add request timeout unless user already provided one
-  CMD_TO_RUN="${CMD_STR}"
-  if [[ "${CMD_STR}" != *"--request-timeout"* ]]; then
-    CMD_TO_RUN="${CMD_STR} --request-timeout=30s"
-  fi
-
-  log "  Step: run ${CMD_TO_RUN}"
+  log "  Step: run ${CMD_STR}"
 
   # Run via bash so pipes/grep work; capture stdout+stderr
-  if ! bash -lc "${CMD_TO_RUN}" >> "${RESULTS_FILE}" 2>&1; then
+  if ! bash -lc "${CMD_STR}" >> "${RESULTS_FILE}" 2>&1; then
     echo "" >> "${RESULTS_FILE}"
     echo "[WARN] command failed for cluster: ${cluster}" >> "${RESULTS_FILE}"
     log "  WARN: command failed (recorded)"
