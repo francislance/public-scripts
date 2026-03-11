@@ -1,5 +1,5 @@
 #!/bin/bash
-set -uo pipefail
+set -eo pipefail
 
 usage() {
   cat <<'USAGE'
@@ -13,7 +13,7 @@ Examples:
 
 Notes:
   - CPU examples: 500m, 2, 4.5
-  - Memory examples: 512Mi, 8Gi, 2000M
+  - Memory examples: 512Mi, 8Gi, 2000M, 129e6
   - Available now = allocable - scheduled pod requests
   - Safe available = (allocable - buffer) - scheduled pod requests
   - Default buffer = 10%
@@ -33,62 +33,70 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
 
-parse_cpu() {
-  local q="${1:-0}"
+# ------------------------------------------------------------------------------
+# Parse generic Kubernetes quantity into base units
+# kind=cpu -> output millicores
+# kind=mem -> output bytes
+# Supports:
+#   plain numbers, decimals, exponent notation
+#   binary suffixes: Ki Mi Gi Ti Pi Ei
+#   decimal suffixes: n u m k K M G T P E
+# ------------------------------------------------------------------------------
+parse_quantity() {
+  local kind="$1"
+  local q="${2:-0}"
+  local num suffix factor
 
   [[ -z "$q" || "$q" == "null" ]] && { echo 0; return 0; }
 
-  case "$q" in
-    *m)
-      echo "${q%m}"
-      ;;
-    *)
-      awk -v q="$q" 'BEGIN {
-        if (q ~ /^[0-9]+([.][0-9]+)?$/) {
-          printf "%.0f", q * 1000
-        } else {
-          exit 1
-        }
-      }' || return 1
-      ;;
+  if [[ "$q" =~ ^([+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?)(Ki|Mi|Gi|Ti|Pi|Ei|n|u|m|k|K|M|G|T|P|E)?$ ]]; then
+    num="${BASH_REMATCH[1]}"
+    suffix="${BASH_REMATCH[5]}"
+  else
+    return 1
+  fi
+
+  case "$suffix" in
+    "")  factor="1" ;;
+    n)   factor="0.000000001" ;;
+    u)   factor="0.000001" ;;
+    m)   factor="0.001" ;;
+    k|K) factor="1000" ;;
+    M)   factor="1000000" ;;
+    G)   factor="1000000000" ;;
+    T)   factor="1000000000000" ;;
+    P)   factor="1000000000000000" ;;
+    E)   factor="1000000000000000000" ;;
+    Ki)  factor="1024" ;;
+    Mi)  factor="1048576" ;;
+    Gi)  factor="1073741824" ;;
+    Ti)  factor="1099511627776" ;;
+    Pi)  factor="1125899906842624" ;;
+    Ei)  factor="1152921504606846976" ;;
+    *) return 1 ;;
   esac
+
+  if [[ "$kind" == "cpu" ]]; then
+    awk -v n="$num" -v f="$factor" 'BEGIN {
+      v = n * f * 1000
+      if (v >= 0) printf "%.0f", v
+      else printf "%.0f", v
+    }' || return 1
+  else
+    awk -v n="$num" -v f="$factor" 'BEGIN {
+      v = n * f
+      if (v >= 0) printf "%.0f", v
+      else printf "%.0f", v
+    }' || return 1
+  fi
+}
+
+parse_cpu() {
+  parse_quantity cpu "${1:-0}"
 }
 
 parse_mem() {
-  local q="${1:-0}"
-  local num mult
-
-  [[ -z "$q" || "$q" == "null" ]] && { echo 0; return 0; }
-
-  case "$q" in
-    *Ki) num="${q%Ki}"; mult=1024 ;;
-    *Mi) num="${q%Mi}"; mult=1048576 ;;
-    *Gi) num="${q%Gi}"; mult=1073741824 ;;
-    *Ti) num="${q%Ti}"; mult=1099511627776 ;;
-    *Pi) num="${q%Pi}"; mult=1125899906842624 ;;
-    *Ei) num="${q%Ei}"; mult=1152921504606846976 ;;
-    *K)  num="${q%K}";  mult=1000 ;;
-    *M)  num="${q%M}";  mult=1000000 ;;
-    *G)  num="${q%G}";  mult=1000000000 ;;
-    *T)  num="${q%T}";  mult=1000000000000 ;;
-    *P)  num="${q%P}";  mult=1000000000000000 ;;
-    *E)  num="${q%E}";  mult=1000000000000000000 ;;
-    *)
-      if [[ "$q" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-        echo "$q"
-        return 0
-      fi
-      return 1
-      ;;
-  esac
-
-  awk -v n="$num" -v m="$mult" 'BEGIN {
-    if (n ~ /^[0-9]+([.][0-9]+)?$/) {
-      printf "%.0f", n * m
-    } else {
-      exit 1
-    }
-  }' || return 1
+  parse_quantity mem "${1:-0}"
 }
 
 format_cpu() {
@@ -100,18 +108,24 @@ format_mem() {
   local b="${1:-0}"
   awk -v b="$b" '
     BEGIN {
+      sign = ""
+      if (b < 0) {
+        sign = "-"
+        b = -b
+      }
+
       kib = 1024
       mib = 1024 * 1024
       gib = 1024 * 1024 * 1024
       tib = gib * 1024
       pib = tib * 1024
 
-      if      (b >= pib) printf "%.2f Pi", b / pib
-      else if (b >= tib) printf "%.2f Ti", b / tib
-      else if (b >= gib) printf "%.2f Gi", b / gib
-      else if (b >= mib) printf "%.2f Mi", b / mib
-      else if (b >= kib) printf "%.2f Ki", b / kib
-      else               printf "%d B", b
+      if      (b >= pib) printf "%s%.2f Pi", sign, b / pib
+      else if (b >= tib) printf "%s%.2f Ti", sign, b / tib
+      else if (b >= gib) printf "%s%.2f Gi", sign, b / gib
+      else if (b >= mib) printf "%s%.2f Mi", sign, b / mib
+      else if (b >= kib) printf "%s%.2f Ki", sign, b / kib
+      else               printf "%s%d B", sign, b
     }
   '
 }
@@ -126,17 +140,17 @@ percent_of() {
 }
 
 sum_csv_cpu() {
-  local csv="${1-}"
+  local csv="${1:-}"
   local total=0
   local item val
-  local -a arr=()
+  local arr
 
   [[ -z "$csv" ]] && { echo 0; return 0; }
 
   IFS=',' read -r -a arr <<< "$csv"
   for item in "${arr[@]}"; do
     [[ -z "$item" ]] && continue
-    val=$(parse_cpu "$item") || return 1
+    val="$(parse_cpu "$item")" || return 1
     total=$(( total + val ))
   done
 
@@ -144,17 +158,17 @@ sum_csv_cpu() {
 }
 
 max_csv_cpu() {
-  local csv="${1-}"
+  local csv="${1:-}"
   local max=0
   local item val
-  local -a arr=()
+  local arr
 
   [[ -z "$csv" ]] && { echo 0; return 0; }
 
   IFS=',' read -r -a arr <<< "$csv"
   for item in "${arr[@]}"; do
     [[ -z "$item" ]] && continue
-    val=$(parse_cpu "$item") || return 1
+    val="$(parse_cpu "$item")" || return 1
     (( val > max )) && max=$val
   done
 
@@ -162,17 +176,17 @@ max_csv_cpu() {
 }
 
 sum_csv_mem() {
-  local csv="${1-}"
+  local csv="${1:-}"
   local total=0
   local item val
-  local -a arr=()
+  local arr
 
   [[ -z "$csv" ]] && { echo 0; return 0; }
 
   IFS=',' read -r -a arr <<< "$csv"
   for item in "${arr[@]}"; do
     [[ -z "$item" ]] && continue
-    val=$(parse_mem "$item") || return 1
+    val="$(parse_mem "$item")" || return 1
     total=$(( total + val ))
   done
 
@@ -180,17 +194,17 @@ sum_csv_mem() {
 }
 
 max_csv_mem() {
-  local csv="${1-}"
+  local csv="${1:-}"
   local max=0
   local item val
-  local -a arr=()
+  local arr
 
   [[ -z "$csv" ]] && { echo 0; return 0; }
 
   IFS=',' read -r -a arr <<< "$csv"
   for item in "${arr[@]}"; do
     [[ -z "$item" ]] && continue
-    val=$(parse_mem "$item") || return 1
+    val="$(parse_mem "$item")" || return 1
     (( val > max )) && max=$val
   done
 
@@ -268,8 +282,8 @@ log "Calculating allocable CPU and RAM..."
 while IFS=$'\t' read -r node cpu mem; do
   [[ -z "$node" ]] && continue
 
-  cpu_m=$(parse_cpu "$cpu") || die "Cannot parse allocable CPU '$cpu' on node '$node'"
-  mem_b=$(parse_mem "$mem") || die "Cannot parse allocable memory '$mem' on node '$node'"
+  cpu_m="$(parse_cpu "$cpu")" || die "Cannot parse allocable CPU '$cpu' on node '$node'"
+  mem_b="$(parse_mem "$mem")" || die "Cannot parse allocable memory '$mem' on node '$node'"
 
   node_count=$(( node_count + 1 ))
   total_alloc_cpu=$(( total_alloc_cpu + cpu_m ))
@@ -288,23 +302,23 @@ log "Calculating scheduled pod requests and limits..."
 while IFS=$'\x1f' read -r ns name node_name app_req_cpu init_req_cpu overhead_cpu app_req_mem init_req_mem overhead_mem app_lim_cpu init_lim_cpu app_lim_mem init_lim_mem; do
   [[ -z "$ns" ]] && continue
 
-  app_req_cpu_sum=$(sum_csv_cpu "$app_req_cpu") || die "Cannot parse app CPU requests for pod $ns/$name"
-  init_req_cpu_max=$(max_csv_cpu "$init_req_cpu") || die "Cannot parse init CPU requests for pod $ns/$name"
-  over_cpu=$(parse_cpu "$overhead_cpu") || die "Cannot parse overhead CPU '$overhead_cpu' for pod $ns/$name"
+  app_req_cpu_sum="$(sum_csv_cpu "$app_req_cpu")" || die "Cannot parse app CPU requests '$app_req_cpu' for pod $ns/$name"
+  init_req_cpu_max="$(max_csv_cpu "$init_req_cpu")" || die "Cannot parse init CPU requests '$init_req_cpu' for pod $ns/$name"
+  over_cpu="$(parse_cpu "$overhead_cpu")" || die "Cannot parse overhead CPU '$overhead_cpu' for pod $ns/$name"
   pod_req_cpu=$(( $(max_int "$app_req_cpu_sum" "$init_req_cpu_max") + over_cpu ))
 
-  app_req_mem_sum=$(sum_csv_mem "$app_req_mem") || die "Cannot parse app memory requests for pod $ns/$name"
-  init_req_mem_max=$(max_csv_mem "$init_req_mem") || die "Cannot parse init memory requests for pod $ns/$name"
-  over_mem=$(parse_mem "$overhead_mem") || die "Cannot parse overhead memory '$overhead_mem' for pod $ns/$name"
+  app_req_mem_sum="$(sum_csv_mem "$app_req_mem")" || die "Cannot parse app memory requests '$app_req_mem' for pod $ns/$name"
+  init_req_mem_max="$(max_csv_mem "$init_req_mem")" || die "Cannot parse init memory requests '$init_req_mem' for pod $ns/$name"
+  over_mem="$(parse_mem "$overhead_mem")" || die "Cannot parse overhead memory '$overhead_mem' for pod $ns/$name"
   pod_req_mem=$(( $(max_int "$app_req_mem_sum" "$init_req_mem_max") + over_mem ))
 
-  app_lim_cpu_sum=$(sum_csv_cpu "$app_lim_cpu") || die "Cannot parse app CPU limits for pod $ns/$name"
-  init_lim_cpu_max=$(max_csv_cpu "$init_lim_cpu") || die "Cannot parse init CPU limits for pod $ns/$name"
-  pod_lim_cpu=$(max_int "$app_lim_cpu_sum" "$init_lim_cpu_max")
+  app_lim_cpu_sum="$(sum_csv_cpu "$app_lim_cpu")" || die "Cannot parse app CPU limits '$app_lim_cpu' for pod $ns/$name"
+  init_lim_cpu_max="$(max_csv_cpu "$init_lim_cpu")" || die "Cannot parse init CPU limits '$init_lim_cpu' for pod $ns/$name"
+  pod_lim_cpu=$(( $(max_int "$app_lim_cpu_sum" "$init_lim_cpu_max") + over_cpu ))
 
-  app_lim_mem_sum=$(sum_csv_mem "$app_lim_mem") || die "Cannot parse app memory limits for pod $ns/$name"
-  init_lim_mem_max=$(max_csv_mem "$init_lim_mem") || die "Cannot parse init memory limits for pod $ns/$name"
-  pod_lim_mem=$(max_int "$app_lim_mem_sum" "$init_lim_mem_max")
+  app_lim_mem_sum="$(sum_csv_mem "$app_lim_mem")" || die "Cannot parse app memory limits '$app_lim_mem' for pod $ns/$name"
+  init_lim_mem_max="$(max_csv_mem "$init_lim_mem")" || die "Cannot parse init memory limits '$init_lim_mem' for pod $ns/$name"
+  pod_lim_mem=$(( $(max_int "$app_lim_mem_sum" "$init_lim_mem_max") + over_mem ))
 
   pod_count=$(( pod_count + 1 ))
   total_req_cpu=$(( total_req_cpu + pod_req_cpu ))
@@ -379,8 +393,8 @@ missing_mem_lim="$(jq '
 raw_free_cpu=$(( total_alloc_cpu - total_req_cpu ))
 raw_free_mem=$(( total_alloc_mem - total_req_mem ))
 
-safe_capacity_cpu=$(awk -v a="$total_alloc_cpu" -v p="$BUFFER_PERCENT" 'BEGIN { printf "%.0f", a * (100 - p) / 100 }')
-safe_capacity_mem=$(awk -v a="$total_alloc_mem" -v p="$BUFFER_PERCENT" 'BEGIN { printf "%.0f", a * (100 - p) / 100 }')
+safe_capacity_cpu="$(awk -v a="$total_alloc_cpu" -v p="$BUFFER_PERCENT" 'BEGIN { printf "%.0f", a * (100 - p) / 100 }')"
+safe_capacity_mem="$(awk -v a="$total_alloc_mem" -v p="$BUFFER_PERCENT" 'BEGIN { printf "%.0f", a * (100 - p) / 100 }')"
 
 safe_free_cpu=$(( safe_capacity_cpu - total_req_cpu ))
 safe_free_mem=$(( safe_capacity_mem - total_req_mem ))
@@ -426,11 +440,11 @@ if [[ -n "$REQUEST_CPU" || -n "$REQUEST_MEM" ]]; then
   want_mem=0
 
   if [[ -n "$REQUEST_CPU" ]]; then
-    want_cpu=$(parse_cpu "$REQUEST_CPU") || die "Cannot parse requested CPU value: $REQUEST_CPU"
+    want_cpu="$(parse_cpu "$REQUEST_CPU")" || die "Cannot parse requested CPU value: $REQUEST_CPU"
   fi
 
   if [[ -n "$REQUEST_MEM" ]]; then
-    want_mem=$(parse_mem "$REQUEST_MEM") || die "Cannot parse requested memory value: $REQUEST_MEM"
+    want_mem="$(parse_mem "$REQUEST_MEM")" || die "Cannot parse requested memory value: $REQUEST_MEM"
   fi
 
   scheduler_fit="YES"
