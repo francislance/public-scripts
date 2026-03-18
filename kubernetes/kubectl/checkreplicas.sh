@@ -1,0 +1,1 @@
+kubectl get deployments -A -o go-template='{{range .items}}{{if lt (or .spec.replicas 1) 2}}{{.metadata.namespace}}{{"\t"}}{{.metadata.name}}{{"\t"}}{{or .spec.replicas 1}}{{"\n"}}{{end}}{{end}}'
