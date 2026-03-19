@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: terminating-test-pod
+  namespace: default
+  finalizers:
+    - test.chatgpt/finalizer
+spec:
+  terminationGracePeriodSeconds: 120
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "pb-app"
+      effect: "NoSchedule"
+  containers:
+    - name: sleeper
+      image: busybox:1.36
+      command: ["/bin/sh", "-c", "sleep 36000"]
+      lifecycle:
+        preStop:
+          exec:
+            command: ["/bin/sh", "-c", "sleep 36000"]
