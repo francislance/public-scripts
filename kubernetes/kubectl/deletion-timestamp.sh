@@ -1,0 +1,1 @@
+kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.metadata.deletionTimestamp}{"\n"}'
